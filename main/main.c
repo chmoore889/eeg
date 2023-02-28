@@ -9,10 +9,4 @@ void app_main(void) {
     ESP_LOGE(tag, "Failed to initialize EEG device");
     return;
   }
-
-  print_id();
-  if(err != ESP_OK) {
-    ESP_LOGE(tag, "Failed to get ID");
-    return;
-  }
 }

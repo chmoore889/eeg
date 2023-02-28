@@ -1,22 +1,22 @@
 #include <string.h>
-#include "esp_log.h"
+
 #include "driver/spi_master.h"
+#include "esp_log.h"
+#include "esp_check.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "eeg_driver.h"
 
-#define RETURN_ON_ERROR(x) if (x != ESP_OK) return x
+#include "eeg_driver.h"
+#include "eeg_driver_int.h"
+
+#define EXTRACT_BITS(data, lowBit, size) ((data >> lowBit) & ((1 << size) - 1))
 
 #define BYTE_TO_BINARY_PATTERN "%c%c%c%c%c%c%c%c"
-#define BYTE_TO_BINARY(byte)  \
-  (byte & 0x80 ? '1' : '0'), \
-  (byte & 0x40 ? '1' : '0'), \
-  (byte & 0x20 ? '1' : '0'), \
-  (byte & 0x10 ? '1' : '0'), \
-  (byte & 0x08 ? '1' : '0'), \
-  (byte & 0x04 ? '1' : '0'), \
-  (byte & 0x02 ? '1' : '0'), \
-  (byte & 0x01 ? '1' : '0') 
+#define BYTE_TO_BINARY(byte)                                \
+  (byte & 0x80 ? '1' : '0'), (byte & 0x40 ? '1' : '0'),     \
+      (byte & 0x20 ? '1' : '0'), (byte & 0x10 ? '1' : '0'), \
+      (byte & 0x08 ? '1' : '0'), (byte & 0x04 ? '1' : '0'), \
+      (byte & 0x02 ? '1' : '0'), (byte & 0x01 ? '1' : '0')
 
 #define UNUSED -1
 #define SPI_MOSI_PIN 12
@@ -24,74 +24,44 @@
 #define SPI_MISO_PIN 13
 #define CS_ENABLE_PIN 6
 
-#define SPI_CLK_FREQ 4E6//DO NOT EXCEED 4E6 - See 9.5.3.1 of ADS1299 datasheet
+#define SPI_CLK_FREQ \
+  1E6  // DO NOT EXCEED 4E6 - See 9.5.3.1 of ADS1299
+       // datasheet
 #define SPI_QUEUE_SIZE 16
 #define SPI_MODE 1
 #define SPI_HOST_LOCAL SPI2_HOST
 
-//Command definitions (Table 10)
-#define RESET 0x06
-#define WAKEUP 0x02
-#define STANDBY 0x04
-#define START 0x08
-#define STOP 0x0A
-#define RREG1_UPPER 0x20
-#define RREG1_LOWER_MASK 0x1F
-
-//Register map (Table 11)
-#define ID 0x00
-#define CONFIG1 0x01
-#define CONFIG2 0x02
-#define CONFIG3 0x03
-#define LOFF 0x04
-#define CH1SET 0x05
-#define CH2SET 0x06
-#define CH3SET 0x07
-#define CH4SET 0x08
-#define CH5SET 0x09
-#define CH6SET 0x0A
-#define CH7SET 0x0B
-#define CH8SET 0x0C
-#define BIAS_SENSP 0x0D
-#define BIAS_SENSN 0x0E
-#define LOFF_SENSP 0x0F
-#define LOFF_SENSN 0x10
-#define LOFF_FLIP 0x11
-#define LOFF_STATP 0x12
-#define LOFF_STATN 0x13
-#define GPIO 0x14
-#define MISC1 0x15
-#define MISC2 0x16
-#define CONFIG4 0x17
-
 typedef struct {
   spi_device_handle_t handle;
-  uint8_t id;
+  uint8_t num_channels;
 } eeg_t;
 
 static const char tag[] = "eeg_driver";
-eeg_t status;
+static eeg_t status = {0};
+
+uint8_t getNumChannels(void) { return status.num_channels; }
 
 static esp_err_t write_command(spi_device_handle_t handle, uint8_t data) {
   spi_transaction_t transaction = {
-    .flags = SPI_TRANS_USE_TXDATA,
-    .length = sizeof(data) * 8,
+      .flags = SPI_TRANS_USE_TXDATA,
+      .length = sizeof(data) * 8,
   };
 
   memcpy(transaction.tx_data, &data, sizeof(data));
 
-  ESP_LOGD(tag, "Wrote: "BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(data));
+  ESP_LOGD(tag, "Wrote: " BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(data));
 
   return spi_device_transmit(handle, &transaction);
 }
 
-static esp_err_t read_register(spi_device_handle_t handle, uint8_t address, uint8_t* dataOut) {
-  uint8_t command[2] = {RREG1_UPPER | (address & RREG1_LOWER_MASK), 1};
+static esp_err_t read_register(spi_device_handle_t handle, uint8_t address,
+                               uint8_t* dataOut) {
+  const uint8_t command[2] = {RREG_UPPER | (address & RREG_LOWER_MASK), 1};
 
   spi_transaction_t transaction = {
-    .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA,
-    .length = sizeof(command)*8,
-    .rxlength = sizeof(*dataOut)*8,
+      .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA,
+      .length = sizeof(command) * 8,
+      .rxlength = sizeof(*dataOut) * 8,
   };
 
   memcpy(transaction.tx_data, command, sizeof(command));
@@ -102,59 +72,125 @@ static esp_err_t read_register(spi_device_handle_t handle, uint8_t address, uint
   return err;
 }
 
-esp_err_t reset() {
-  return write_command(status.handle, RESET);
+static esp_err_t write_register(spi_device_handle_t handle, uint8_t address,
+                                uint8_t data) {
+  const uint8_t command[2] = {WREG_UPPER | (address & WREG_LOWER_MASK), 1};
+  const size_t length_bytes = sizeof(command) + sizeof(data);
+
+  spi_transaction_t transaction = {
+      .flags = SPI_TRANS_USE_TXDATA,
+      .length = length_bytes * 8,
+  };
+
+  memcpy(transaction.tx_data, command, sizeof(command));
+  memcpy(transaction.tx_data + sizeof(command), &data, sizeof(data));
+
+  return spi_device_transmit(handle, &transaction);
 }
 
-esp_err_t wakeup() {
-  return write_command(status.handle, WAKEUP);
+esp_err_t reset() { return write_command(status.handle, RESET); }
+
+esp_err_t wakeup() { return write_command(status.handle, WAKEUP); }
+
+esp_err_t standby() { return write_command(status.handle, STANDBY); }
+
+esp_err_t start() { return write_command(status.handle, START); }
+
+esp_err_t stop() { return write_command(status.handle, STOP); }
+
+esp_err_t read_data_continuous(void) {
+  return write_command(status.handle, RDATAC);
 }
 
-esp_err_t standby() {
-  return write_command(status.handle, STANDBY);
+esp_err_t stop_data_continuous(void) {
+  return write_command(status.handle, SDATAC);
 }
 
-esp_err_t start() {
-  return write_command(status.handle, START);
+esp_err_t read_data(void) {
+  return write_command(status.handle, RDATA);
 }
 
-esp_err_t stop() {
-  return write_command(status.handle, STOP);
-}
-
+// Resets EEG device and sets configuration registers
+// Initial settings are as follows:
+// Enable internal reference, set internal bias reference, enable bias buffer
+// Enable SRB1 (referential montage)
 esp_err_t eeg_dev_init(void) {
   const spi_bus_config_t spi_config = {
-    .mosi_io_num = SPI_MOSI_PIN,
-    .miso_io_num = SPI_MISO_PIN,
-    .sclk_io_num = SPI_SCLK_PIN,
-    .quadwp_io_num = UNUSED,
-    .quadhd_io_num = UNUSED,
-    .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK | SPICOMMON_BUSFLAG_DUAL,
+      .mosi_io_num = SPI_MOSI_PIN,
+      .miso_io_num = SPI_MISO_PIN,
+      .sclk_io_num = SPI_SCLK_PIN,
+      .quadwp_io_num = UNUSED,
+      .quadhd_io_num = UNUSED,
+      .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK |
+               SPICOMMON_BUSFLAG_DUAL,
   };
-  RETURN_ON_ERROR(spi_bus_initialize(SPI_HOST_LOCAL, &spi_config, SPI_DMA_AUTO));
+  ESP_RETURN_ON_ERROR(
+      spi_bus_initialize(SPI_HOST_LOCAL, &spi_config, SPI_DMA_CH_AUTO), tag,
+      "Failed to initialize SPI bus");
 
   const spi_device_interface_config_t dev_config = {
-    .clock_speed_hz = SPI_CLK_FREQ,
-    .queue_size = SPI_QUEUE_SIZE,
-    .mode = SPI_MODE,
-    .spics_io_num = CS_ENABLE_PIN,
+      .clock_speed_hz = SPI_CLK_FREQ,
+      .queue_size = SPI_QUEUE_SIZE,
+      .mode = SPI_MODE,
+      .spics_io_num = CS_ENABLE_PIN,
   };
-  RETURN_ON_ERROR(spi_bus_add_device(SPI_HOST_LOCAL, &dev_config, &status.handle));
+  ESP_RETURN_ON_ERROR(
+      spi_bus_add_device(SPI_HOST_LOCAL, &dev_config, &status.handle), tag,
+      "Failed to add SPI device");
 
-  //Initial device commands
-  RETURN_ON_ERROR(reset());
+  // Initial device commands
+  ESP_RETURN_ON_ERROR(reset(), tag, "Failed to reset device");
+  ESP_LOGD(tag, "Sent reset command");
 
   vTaskDelay(1 / portTICK_PERIOD_MS);
 
-  //RETURN_ON_ERROR(self_test(&status));
+  // Send SDATAC command to stop continuous data and allow for other commands
+  // See figure 67 in ADS1299 datasheet
+  ESP_RETURN_ON_ERROR(stop_data_continuous(), tag,
+                      "Failed to stop initial data");
+  ESP_LOGD(tag, "Stopped initial data");
 
-  ESP_LOGI(tag, "Initialized");
+  // Read ID register
+  uint8_t rawIDReg;
+  ESP_RETURN_ON_ERROR(read_register(status.handle, ID, &rawIDReg), tag,
+                      "Failed to read ID");
 
-  return ESP_OK;
-}
+  // Extract and check device ID from ID register
+  const uint8_t extractedId = EXTRACT_BITS(rawIDReg, 2, 2);
+  if (extractedId != ADS1299_DEVICE_ID) {
+    ESP_LOGE(tag, "Device ID is incorrect. Expected %u, got %u",
+             ADS1299_DEVICE_ID, extractedId);
+    return ESP_FAIL;
+  }
+  ESP_LOGD(tag, "Device ID is correct");
 
-esp_err_t print_id() {
-  RETURN_ON_ERROR(read_register(status.handle, 0x00, &status.id));
-  ESP_LOGI(tag, "ID: "BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(status.id));
+  // Extract number of channels from ID register
+  const uint8_t numChannelCode = EXTRACT_BITS(rawIDReg, 0, 2) + 1;
+
+  // See 9.6.1.1 in ADS1299 datasheet for codes
+  switch (numChannelCode) {
+    case 0b00:
+      status.num_channels = 4;
+      break;
+    case 0b01:
+      status.num_channels = 6;
+      break;
+    case 0b10:
+      status.num_channels = 8;
+      break;
+  }
+  ESP_LOGD(tag, "Number of channels: %u", status.num_channels);
+
+  // Enable internal reference, set internal bias reference, enable bias buffer
+  ESP_RETURN_ON_ERROR(write_register(status.handle, CONFIG3,
+                                     ADS1299_REG_CONFIG3_REFBUF_ENABLED |
+                                         ADS1299_REG_CONFIG3_BIASREF_INT |
+                                         ADS1299_REG_CONFIG3_BIASBUF_ENABLED),
+                      tag, "Failed to write CONFIG3");
+
+  // Enable SRB1 (referential montage)
+  ESP_RETURN_ON_ERROR(write_register(status.handle, MISC1, ADS1299_REG_MISC1_SRB1_ON), tag, "Failed to write MISC1");
+
+  ESP_LOGI(tag, "Initialized EEG device");
   return ESP_OK;
 }
